@@ -79,11 +79,28 @@ def _secret(key: str) -> str:
         return ""
 
 FD_KEY  = _secret("FOOTBALL_DATA_KEY")   # football-data.org
-AF_KEY  = _secret("API_FOOTBALL_KEY")    # api-football.com
+AF_KEY  = _secret("API_FOOTBALL_KEY")    # api-football.com (opcional)
+BZ_KEY  = _secret("BZZOIRO_KEY")         # sports.bzzoiro.com (gratis, sem rate limit)
 
 HAS_FD  = bool(FD_KEY)
 HAS_AF  = bool(AF_KEY)
-HAS_ANY = HAS_FD or HAS_AF
+HAS_BZ  = bool(BZ_KEY)
+HAS_ANY = HAS_FD or HAS_AF or HAS_BZ
+
+# Throttle para API-Football (max 8 req/min)
+import time as _time
+if "af_req_times" not in st.session_state:
+    st.session_state["af_req_times"] = []
+
+def _af_throttle():
+    now = _time.time()
+    st.session_state["af_req_times"] = [t for t in st.session_state["af_req_times"] if now - t < 60]
+    if len(st.session_state["af_req_times"]) >= 8:
+        wait = 60 - (now - st.session_state["af_req_times"][0]) + 0.5
+        if wait > 0:
+            st.toast(f"API-Football: aguardando {wait:.0f}s (rate limit)...", icon="\u23f3")
+            _time.sleep(wait)
+    st.session_state["af_req_times"].append(_time.time())
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RAW REQUEST HELPERS
@@ -113,6 +130,7 @@ def _fd_get(endpoint: str, params: dict = None) -> dict | None:
 def _af_get(endpoint: str, params: dict = None) -> dict | None:
     if not AF_KEY:
         return None
+    _af_throttle()
     try:
         r = requests.get(
             f"https://v3.football.api-sports.io{endpoint}",
@@ -133,6 +151,28 @@ def _af_get(endpoint: str, params: dict = None) -> dict | None:
     except Exception as e:
         st.error(f"API-Football conexão: {e}"); return None
 
+def _bz_get(endpoint: str, params: dict = None) -> dict | None:
+    """Bzzoiro Sports Data — gratuita, sem rate limit, sem cartao."""
+    if not BZ_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"https://sports.bzzoiro.com{endpoint}",
+            headers={"Authorization": f"Token {BZ_KEY}"},
+            params=params, timeout=12,
+        )
+        if r.status_code == 200:
+            return r.json()
+        elif r.status_code == 401:
+            st.error("Bzzoiro: Chave invalida. Verifique BZZOIRO_KEY.")
+        elif r.status_code == 404:
+            return None  # silently — resource may not exist for this league
+        else:
+            st.error(f"Bzzoiro HTTP {r.status_code}")
+        return None
+    except Exception as e:
+        st.error(f"Bzzoiro conexao: {e}"); return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LEAGUE CONFIG  (IDs para cada API)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,7 +183,8 @@ LEAGUES = {
         "fd_id": 2013, "fd_free": True,
         "af_id": 71,
         "af_season_default": 2025,   # temporada começa em Abril/2025
-        "af_season_type": "calendar", # Jan–Dez
+        "af_season_type": "calendar",
+        "bz_id": 9, # Jan–Dez
     },
     # Calendário europeu (Ago–Mai) → temporada atual = 2024 (2024/25)
     "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League": {
@@ -152,6 +193,7 @@ LEAGUES = {
         "af_id": 39,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 1,
     },
     "🇪🇸 La Liga": {
         "flag": "🇪🇸",
@@ -159,6 +201,7 @@ LEAGUES = {
         "af_id": 140,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 3,
     },
     "🇩🇪 Bundesliga": {
         "flag": "🇩🇪",
@@ -166,6 +209,7 @@ LEAGUES = {
         "af_id": 78,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 5,
     },
     "🇫🇷 Ligue 1": {
         "flag": "🇫🇷",
@@ -173,6 +217,7 @@ LEAGUES = {
         "af_id": 61,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 6,
     },
     "🇵🇹 Liga Portugal": {
         "flag": "🇵🇹",
@@ -180,6 +225,7 @@ LEAGUES = {
         "af_id": 94,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 2,
     },
     "🇮🇹 Serie A": {
         "flag": "🇮🇹",
@@ -187,8 +233,194 @@ LEAGUES = {
         "af_id": 135,
         "af_season_default": 2024,
         "af_season_type": "european",
+        "bz_id": 4,
     },
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATA FUNCTIONS — Bzzoiro Sports Data  (sports.bzzoiro.com)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def bz_standings(bz_league_id: int) -> pd.DataFrame:
+    data = _bz_get("/api/standings/", {"league": bz_league_id})
+    if not data:
+        return pd.DataFrame()
+    rows = []
+    standings = data if isinstance(data, list) else data.get("standings", data.get("results", []))
+    for e in standings:
+        team = e.get("team", {}) if isinstance(e.get("team"), dict) else {"name": e.get("team_name", ""), "id": e.get("team_id", 0)}
+        rows.append({
+            "Pos":      e.get("rank", e.get("position", 0)),
+            "Time":     team.get("name", e.get("team_name", "")),
+            "team_id_bz": team.get("id", e.get("team_id", 0)),
+            "PJ":  e.get("played", e.get("games_played", 0)),
+            "V":   e.get("won", e.get("wins", 0)),
+            "E":   e.get("drawn", e.get("draws", 0)),
+            "D":   e.get("lost", e.get("losses", 0)),
+            "GP":  e.get("goals_for", e.get("goals_scored", 0)),
+            "GC":  e.get("goals_against", e.get("goals_conceded", 0)),
+            "SG":  e.get("goal_difference", 0),
+            "Pts": e.get("points", 0),
+            "Forma": e.get("form", ""),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def bz_players(bz_league_id: int) -> pd.DataFrame:
+    """Fetch player list for a league, then enrich with per-match stats."""
+    data = _bz_get("/api/players/", {"league": bz_league_id})
+    if not data:
+        return pd.DataFrame()
+    results = data if isinstance(data, list) else data.get("results", [])
+    rows = []
+    for p in results:
+        team = p.get("team", {}) if isinstance(p.get("team"), dict) else {}
+        rows.append({
+            "player_id": p.get("id", 0),
+            "Jogador":   p.get("name", ""),
+            "Posição":   p.get("position", ""),
+            "Nac.":      p.get("nationality", ""),
+            "Foto":      p.get("photo", ""),
+            "Time":      team.get("name", p.get("team_name", "")),
+            "Valor (M€)": p.get("market_value_eur", 0),
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=3600)
+def bz_player_stats(bz_league_id: int) -> pd.DataFrame:
+    """Aggregate per-match player stats into season totals."""
+    data = _bz_get("/api/player-stats/", {"league": bz_league_id, "limit": 500})
+    if not data:
+        return pd.DataFrame()
+    results = data if isinstance(data, list) else data.get("results", [])
+    if not results:
+        return pd.DataFrame()
+
+    # Aggregate by player
+    from collections import defaultdict
+    agg = defaultdict(lambda: {
+        "Jogador": "", "Time": "", "Posição": "", "Foto": "",
+        "Jogos": 0, "Minutos": 0, "Gols": 0, "Assistencias": 0,
+        "Chutes": 0, "Chutes_alvo": 0,
+        "Passes": 0, "Passes_chave": 0,
+        "Desarmes": 0, "Interceptacoes": 0,
+        "Amarelos": 0, "Vermelhos": 0,
+        "xG_sum": 0.0, "xA_sum": 0.0,
+        "Nota_sum": 0.0, "Nota_cnt": 0,
+        "Dribles_suc": 0, "Dribles_att": 0,
+    })
+
+    for s in results:
+        pid = s.get("player") or s.get("player_id") or s.get("id", 0)
+        a = agg[pid]
+        a["Jogador"]  = s.get("player_name", a["Jogador"])
+        a["Time"]     = s.get("team_name", a["Time"])
+        a["Posição"]  = s.get("position", a["Posição"])
+        a["Foto"]     = s.get("player_photo", a["Foto"])
+        a["Jogos"]   += 1
+        a["Minutos"] += s.get("minutes_played", 0) or 0
+        a["Gols"]    += s.get("goals", 0) or 0
+        a["Assistencias"] += s.get("assists", 0) or 0
+        a["Chutes"]  += s.get("shots_total", 0) or 0
+        a["Chutes_alvo"] += s.get("shots_on_target", 0) or 0
+        a["Passes"]  += s.get("passes_total", 0) or 0
+        a["Passes_chave"] += s.get("key_passes", 0) or 0
+        a["Desarmes"] += s.get("tackles", 0) or 0
+        a["Interceptacoes"] += s.get("interceptions", 0) or 0
+        a["Amarelos"] += s.get("yellow_cards", 0) or 0
+        a["Vermelhos"] += s.get("red_cards", 0) or 0
+        a["xG_sum"]  += float(s.get("xg", 0) or 0)
+        a["xA_sum"]  += float(s.get("xa", 0) or 0)
+        rating = s.get("rating")
+        if rating:
+            try:
+                a["Nota_sum"] += float(rating); a["Nota_cnt"] += 1
+            except Exception:
+                pass
+        a["Dribles_suc"] += s.get("dribbles_success", 0) or 0
+        a["Dribles_att"] += s.get("dribbles_attempts", 0) or 0
+
+    rows = []
+    for pid, a in agg.items():
+        mins = a["Minutos"]
+        p90  = mins / 90 if mins >= 45 else None
+        gols90    = round(a["Gols"]        / p90, 2) if p90 else 0
+        assists90 = round(a["Assistencias"]/ p90, 2) if p90 else 0
+        ga90      = round((a["Gols"]+a["Assistencias"]) / p90, 2) if p90 else 0
+        shots90   = round(a["Chutes"]      / p90, 2) if p90 else 0
+        tack90    = round(a["Desarmes"]    / p90, 2) if p90 else 0
+        conv      = round(a["Gols"]/a["Chutes"]*100, 1) if a["Chutes"] > 0 else 0
+        drib_r    = round(a["Dribles_suc"]/a["Dribles_att"]*100, 1) if a["Dribles_att"] > 0 else 0
+        nota      = round(a["Nota_sum"]/a["Nota_cnt"], 2) if a["Nota_cnt"] > 0 else None
+
+        rows.append({
+            "Jogador":          a["Jogador"],
+            "Time":             a["Time"],
+            "Posição":          a["Posição"],
+            "Foto":             a["Foto"],
+            "Jogos":            a["Jogos"],
+            "Minutos":          mins,
+            "Nota":             nota,
+            "Gols":             a["Gols"],
+            "Assistências":     a["Assistencias"],
+            "G+A":              a["Gols"] + a["Assistencias"],
+            "xG":               round(a["xG_sum"], 2),
+            "xA":               round(a["xA_sum"], 2),
+            "xG+xA":            round(a["xG_sum"] + a["xA_sum"], 2),
+            "Gols/90":          gols90,
+            "Assists/90":       assists90,
+            "G+A/90":           ga90,
+            "Chutes":           a["Chutes"],
+            "Chutes no Alvo":   a["Chutes_alvo"],
+            "Chutes/90":        shots90,
+            "Conversão (%)":    conv,
+            "Passes":           a["Passes"],
+            "Passes-Chave":     a["Passes_chave"],
+            "Precisão Pass (%)": 0,
+            "Dribles Tent.":    a["Dribles_att"],
+            "Dribles Suc.":     a["Dribles_suc"],
+            "Drible (%)":       drib_r,
+            "Desarmes":         a["Desarmes"],
+            "Interceptações":   a["Interceptacoes"],
+            "Bloqueios":        0,
+            "Desarmes/90":      tack90,
+            "Amarelos":         a["Amarelos"],
+            "Vermelhos":        a["Vermelhos"],
+            "Faltas Sofridas":  0,
+            "Faltas Cometidas": 0,
+            "Pen. Marcados":    0,
+            "Pen. Perdidos":    0,
+            "Defesas (GK)":     0,
+            "Gols Sofridos (GK)": 0,
+        })
+    df = pd.DataFrame(rows).sort_values("G+A", ascending=False).reset_index(drop=True)
+    return df
+
+@st.cache_data(ttl=3600)
+def bz_matches(bz_league_id: int, finished: bool = True, limit: int = 30) -> pd.DataFrame:
+    status = "finished" if finished else "notstarted"
+    data = _bz_get("/api/events/", {"league": bz_league_id, "status": status})
+    if not data:
+        return pd.DataFrame()
+    events = data if isinstance(data, list) else data.get("results", [])
+    rows = []
+    for m in (events[-limit:] if finished else events[:limit]):
+        score = m.get("score", {}) or {}
+        gh = score.get("home")
+        ga = score.get("away")
+        dt = (m.get("event_date") or m.get("date") or "")[:10]
+        rows.append({
+            "Data":   dt,
+            "Casa":   m.get("home_team", ""),
+            "Fora":   m.get("away_team", ""),
+            "Placar": f"{gh} – {ga}" if gh is not None else "—",
+            "GH":     gh or 0,
+            "GA":     ga or 0,
+            "Rodada": m.get("round", m.get("matchday", "")),
+        })
+    return pd.DataFrame(rows)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SEASON HELPERS
@@ -418,11 +650,15 @@ def af_fixtures(league_af_id: int, season: int, status: str = "FT", limit: int =
 # UNIFIED STANDINGS  (FD preferred, AF fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_standings(lg: dict, source: str, season: int) -> tuple[pd.DataFrame, str]:
-    """Returns (df, source_used)"""
+    """Returns (df, source_used). Priority: FD > Bzzoiro > AF"""
     if source in ("football-data.org", "Automático") and HAS_FD and lg["fd_free"]:
         df = fd_standings(lg["fd_id"])
         if not df.empty:
             return df, "fd"
+    if source in ("Bzzoiro", "Automático") and HAS_BZ and lg.get("bz_id"):
+        df = bz_standings(lg["bz_id"])
+        if not df.empty:
+            return df, "bz"
     if source in ("API-Football", "Automático") and HAS_AF:
         df = af_standings(lg["af_id"], season)
         if not df.empty:
@@ -440,14 +676,16 @@ Configure ao menos **uma** das APIs gratuitas abaixo:
 | API | Forças | Registro |
 |-----|--------|---------|
 | **football-data.org** | Classificação, partidas, artilheiros | [Registrar](https://www.football-data.org/client/register) |
-| **API-Football** | + Stats de jogadores, métricas/90, notas | [Registrar](https://dashboard.api-football.com/register) |
+| **Bzzoiro Sports Data** | Stats de jogadores, xG, xA, sem rate limit | [Registrar](https://sports.bzzoiro.com/register/) |
+| **API-Football** | Stats avançadas de jogadores, métricas/90 | [Registrar](https://dashboard.api-football.com/register) |
 
 **Streamlit Cloud → Settings → Secrets:**
 ```toml
 FOOTBALL_DATA_KEY = "sua_chave_football_data"
+BZZOIRO_KEY       = "sua_chave_bzzoiro"
 API_FOOTBALL_KEY  = "sua_chave_api_football"
 ```
-Você pode configurar só uma ou as duas — o app se adapta automaticamente.
+Você pode configurar uma, duas ou todas — o app se adapta automaticamente.
 """)
     st.stop()
 
@@ -461,28 +699,31 @@ with st.sidebar:
     # API source selector
     available_sources = []
     if HAS_FD:  available_sources.append("football-data.org")
+    if HAS_BZ:  available_sources.append("Bzzoiro")
     if HAS_AF:  available_sources.append("API-Football")
-    if HAS_FD and HAS_AF:
+    if len(available_sources) > 1:
         available_sources.insert(0, "Automático")
 
     source = st.selectbox(
         "🔌 Fonte de Dados",
         available_sources,
-        help="Automático: usa football-data.org para classificação/partidas e API-Football para jogadores.",
+        help="Automático: football-data.org para classificação/partidas, Bzzoiro para jogadores (sem rate limit), API-Football como fallback.",
     )
 
     # Status pills
-    col_a, col_b = st.columns(2)
+    col_a, col_b, col_c = st.columns(3)
     with col_a:
-        if HAS_FD:
-            st.markdown("<span style='color:#79c0ff;font-size:11px'>✅ football-data.org</span>", unsafe_allow_html=True)
-        else:
-            st.markdown("<span style='color:#8b949e;font-size:11px'>❌ football-data.org</span>", unsafe_allow_html=True)
+        color = "#79c0ff" if HAS_FD else "#8b949e"
+        icon  = "✅" if HAS_FD else "❌"
+        st.markdown(f"<span style='color:{color};font-size:10px'>{icon} football-data</span>", unsafe_allow_html=True)
     with col_b:
-        if HAS_AF:
-            st.markdown("<span style='color:#3fb950;font-size:11px'>✅ API-Football</span>", unsafe_allow_html=True)
-        else:
-            st.markdown("<span style='color:#8b949e;font-size:11px'>❌ API-Football</span>", unsafe_allow_html=True)
+        color = "#e3b341" if HAS_BZ else "#8b949e"
+        icon  = "✅" if HAS_BZ else "❌"
+        st.markdown(f"<span style='color:{color};font-size:10px'>{icon} bzzoiro</span>", unsafe_allow_html=True)
+    with col_c:
+        color = "#3fb950" if HAS_AF else "#8b949e"
+        icon  = "✅" if HAS_AF else "❌"
+        st.markdown(f"<span style='color:{color};font-size:10px'>{icon} api-football</span>", unsafe_allow_html=True)
 
     st.markdown("---")
 
@@ -495,8 +736,9 @@ with st.sidebar:
         "📈 Métricas Avançadas",
         "🏆 Comparar Times",
     ]
-    pages_no_af = ["📊 Classificação", "📅 Partidas & Calendário", "🏆 Comparar Times"]
-    page_list = pages_all if (HAS_AF or source == "API-Football") else pages_no_af
+    pages_no_players = ["📊 Classificação", "📅 Partidas & Calendário", "🏆 Comparar Times"]
+    has_players = HAS_AF or HAS_BZ or source in ("API-Football", "Bzzoiro")
+    page_list = pages_all if has_players else pages_no_players
 
     page = st.radio("", page_list, label_visibility="collapsed")
     st.markdown("---")
@@ -551,8 +793,10 @@ def badge(src: str):
         st.markdown("<span class='source-badge-fd'>football-data.org</span>", unsafe_allow_html=True)
     elif src == "af":
         st.markdown("<span class='source-badge-af'>API-Football</span>", unsafe_allow_html=True)
+    elif src == "bz":
+        st.markdown("<span class='source-badge-af' style='background:#1a1a0d;color:#e3b341;border-color:#e3b341'>Bzzoiro Sports Data</span>", unsafe_allow_html=True)
     else:
-        st.markdown("<span class='source-badge-both'>football-data.org + API-Football</span>", unsafe_allow_html=True)
+        st.markdown("<span class='source-badge-both'>Multi-fonte</span>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS: standings highlight & radar
@@ -581,6 +825,39 @@ def polar_layout(fig):
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE: CLASSIFICAÇÃO
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_player_data(lg: dict, season: int, source: str) -> tuple[pd.DataFrame, str]:
+    """Returns (df, src) — Bzzoiro preferred (no rate limit), AF as fallback."""
+    if source in ("Bzzoiro", "Automático") and HAS_BZ and lg.get("bz_id"):
+        df = bz_player_stats(lg["bz_id"])
+        if not df.empty:
+            return df, "bz"
+    if source in ("API-Football", "Automático") and HAS_AF:
+        df_s = af_top_scorers(lg["af_id"], season)
+        df_a = af_top_assists(lg["af_id"], season)
+        df = pd.concat([df_s, df_a]).drop_duplicates("Jogador").reset_index(drop=True)
+        if not df.empty:
+            return df, "af"
+    return pd.DataFrame(), "none"
+
+def get_fixture_data(lg: dict, season: int, source: str, finished: bool = True, limit: int = 30) -> tuple[pd.DataFrame, str]:
+    """Returns (df, src) for match fixtures."""
+    if source in ("Bzzoiro", "Automático") and HAS_BZ and lg.get("bz_id"):
+        df = bz_matches(lg["bz_id"], finished=finished, limit=limit)
+        if not df.empty:
+            return df, "bz"
+    if source in ("football-data.org", "Automático") and HAS_FD and lg["fd_free"]:
+        status = "FINISHED" if finished else "SCHEDULED"
+        df = fd_matches(lg["fd_id"], status=status, limit=limit)
+        if not df.empty:
+            return df, "fd"
+    if source in ("API-Football", "Automático") and HAS_AF:
+        status = "FT" if finished else "NS"
+        df = af_fixtures(lg["af_id"], season, status=status, limit=limit)
+        if not df.empty:
+            return df, "af"
+    return pd.DataFrame(), "none"
+
 if "Classificação" in page:
     st.title(f"{flag} Classificação · {league_short}")
     with st.spinner("Carregando..."):
@@ -642,7 +919,7 @@ elif "Partidas" in page:
 
     with tab_r:
         with st.spinner("Buscando partidas..."):
-            df_fix, src = _load_matches("FINISHED","FT",30)
+            df_fix, src = get_fixture_data(lg, season, source, finished=True, limit=30)
         if df_fix.empty:
             st.info("Sem resultados.")
         else:
@@ -674,7 +951,7 @@ elif "Partidas" in page:
 
     with tab_n:
         with st.spinner("Buscando agenda..."):
-            df_next, src2 = _load_matches("SCHEDULED","NS",20)
+            df_next, src2 = get_fixture_data(lg, season, source, finished=False, limit=20)
         if df_next.empty:
             st.info("Nenhuma partida agendada.")
         else:
@@ -730,8 +1007,10 @@ elif "Jogadores" in page and "Comparar" not in page:
     t1,t2,t3,t4 = st.tabs(["📋 Tabela","⚡ Gols × Assistências","🎯 Chutes & Conversão","🛡️ Defensivo"])
 
     with t1:
-        cols = ["Jogador","Time","Posição","Jogos","Minutos","Nota","Gols","Assistências",
-                "G+A","Gols/90","Assists/90","G+A/90","Chutes","Conversão (%)","Amarelos","Vermelhos"]
+        base_cols = ["Jogador","Time","Posição","Jogos","Minutos","Nota","Gols","Assistências",
+                     "G+A","Gols/90","Assists/90","G+A/90","Chutes","Conversão (%)","Amarelos","Vermelhos"]
+        xg_cols = ["xG","xA","xG+xA"] if (src_p == "bz" and "xG" in df_p.columns) else []
+        cols = base_cols[:9] + xg_cols + base_cols[9:]
         def hl_t(row):
             if row.name==0: return ["background:#0d4429;color:#56d364"]*len(row)
             if row.name==1: return ["background:#0d2d1a;color:#3fb950"]*len(row)
@@ -784,13 +1063,10 @@ elif "Jogadores" in page and "Comparar" not in page:
 # ─────────────────────────────────────────────────────────────────────────────
 elif "Comparar Jogadores" in page:
     st.title(f"🔀 Comparar Jogadores · {league_short}")
-    badge("af")
-
     with st.spinner("Carregando jogadores..."):
-        df_s = af_top_scorers(lg["af_id"], season)
-        df_a = af_top_assists(lg["af_id"], season)
+        df_all, src_cmp = get_player_data(lg, season, source)
+        badge(src_cmp)
 
-    df_all = pd.concat([df_s,df_a]).drop_duplicates("Jogador").reset_index(drop=True)
     if df_all.empty:
         st.info("Sem dados de jogadores."); st.stop()
 
@@ -882,16 +1158,13 @@ elif "Comparar Jogadores" in page:
 elif "Métricas" in page:
     st.title(f"📈 Métricas Avançadas · {league_short}")
     st.caption("Estatísticas combinadas calculadas a partir dos minutos em campo (mín. 200 min).")
-    badge("af")
-
     with st.spinner("Carregando..."):
-        df_s = af_top_scorers(lg["af_id"], season)
-        df_a = af_top_assists(lg["af_id"], season)
+        df_raw, src_met = get_player_data(lg, season, source)
+        badge(src_met)
 
-    df_all = pd.concat([df_s,df_a]).drop_duplicates("Jogador").reset_index(drop=True)
-    df_all = df_all[df_all["Minutos"]>=200].copy()
+    df_all = df_raw[df_raw["Minutos"] >= 200].copy() if not df_raw.empty else pd.DataFrame()
     if df_all.empty:
-        st.info("Sem dados suficientes."); st.stop()
+        st.info("Sem dados suficientes. Configure BZZOIRO_KEY ou API_FOOTBALL_KEY."); st.stop()
 
     tab1,tab2,tab3,tab4 = st.tabs([
         "🎯 Por 90 Minutos","📊 Distribuições","🔥 Heatmap","📐 Correlações"
@@ -934,6 +1207,24 @@ elif "Métricas" in page:
                               hover_data=["Time","Gols/90","Assistências"])
             fig4.update_traces(textposition="top center")
             st.plotly_chart(sf(fig4,560), use_container_width=True)
+
+        # xG section — only available from Bzzoiro
+        if src_met == "bz" and "xG" in df_all.columns and df_all["xG"].sum() > 0:
+            st.markdown("<div class='section-header'>xG vs Gols Reais (quem superou as expectativas?)</div>", unsafe_allow_html=True)
+            df_xg = df_all[df_all["xG"] > 0].copy()
+            df_xg["Diferença xG"] = df_xg["Gols"] - df_xg["xG"]
+            fig_xg = px.scatter(df_xg.head(30), x="xG", y="Gols",
+                                text="Jogador", color="Diferença xG",
+                                color_continuous_scale="RdYlGn",
+                                hover_data=["Time","xA","G+A"])
+            fig_xg.add_shape(type="line", x0=0, y0=0,
+                             x1=df_xg["xG"].max(), y1=df_xg["xG"].max(),
+                             line=dict(color="#8b949e", dash="dot"))
+            fig_xg.add_annotation(text="Linha xG esperado", x=df_xg["xG"].max()*0.8,
+                                   y=df_xg["xG"].max()*0.75, showarrow=False,
+                                   font=dict(color="#8b949e", size=11))
+            fig_xg.update_traces(textposition="top center")
+            st.plotly_chart(sf(fig_xg, 520), use_container_width=True)
 
     with tab2:
         col_l2,col_r2 = st.columns(2)
@@ -1039,9 +1330,10 @@ elif "Comparar Times" in page:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # Jogadores do time (apenas se AF disponível)
-    if HAS_AF:
-        st.markdown("<div class='section-header'>Jogadores do Time (API-Football)</div>", unsafe_allow_html=True)
-        badge("af")
+    if HAS_AF or HAS_BZ:
+        lbl = "Bzzoiro Sports Data" if (HAS_BZ and source != "API-Football") else "API-Football"
+        st.markdown(f"<div class='section-header'>Jogadores do Time ({lbl})</div>", unsafe_allow_html=True)
+        badge("bz" if (HAS_BZ and source != "API-Football") else "af")
         team_sel = st.selectbox("Ver jogadores de",[t1,t2])
         tid_col = "team_id_af" if "team_id_af" in df_st.columns else ("team_id_fd" if "team_id_fd" in df_st.columns else None)
 
