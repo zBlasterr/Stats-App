@@ -137,42 +137,79 @@ def _af_get(endpoint: str, params: dict = None) -> dict | None:
 # LEAGUE CONFIG  (IDs para cada API)
 # ─────────────────────────────────────────────────────────────────────────────
 LEAGUES = {
+    # Calendário dentro do ano (Jan–Dez) → temporada atual = 2025
     "🇧🇷 Brasileirão Série A": {
         "flag": "🇧🇷",
         "fd_id": 2013, "fd_free": True,
-        "af_id": 71,   "af_season": 2024,
+        "af_id": 71,
+        "af_season_default": 2025,   # temporada começa em Abril/2025
+        "af_season_type": "calendar", # Jan–Dez
     },
+    # Calendário europeu (Ago–Mai) → temporada atual = 2024 (2024/25)
     "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premier League": {
         "flag": "🏴󠁧󠁢󠁥󠁮󠁧󠁿",
         "fd_id": 2021, "fd_free": True,
-        "af_id": 39,   "af_season": 2024,
+        "af_id": 39,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
     "🇪🇸 La Liga": {
         "flag": "🇪🇸",
         "fd_id": 2014, "fd_free": True,
-        "af_id": 140,  "af_season": 2024,
+        "af_id": 140,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
     "🇩🇪 Bundesliga": {
         "flag": "🇩🇪",
         "fd_id": 2002, "fd_free": True,
-        "af_id": 78,   "af_season": 2024,
+        "af_id": 78,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
     "🇫🇷 Ligue 1": {
         "flag": "🇫🇷",
         "fd_id": 2015, "fd_free": False,
-        "af_id": 61,   "af_season": 2024,
+        "af_id": 61,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
     "🇵🇹 Liga Portugal": {
         "flag": "🇵🇹",
         "fd_id": 2017, "fd_free": False,
-        "af_id": 94,   "af_season": 2024,
+        "af_id": 94,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
     "🇮🇹 Serie A": {
         "flag": "🇮🇹",
         "fd_id": 2019, "fd_free": False,
-        "af_id": 135,  "af_season": 2024,
+        "af_id": 135,
+        "af_season_default": 2024,
+        "af_season_type": "european",
     },
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SEASON HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+@st.cache_data(ttl=86400)   # cache 24h — seasons don't change often
+def af_available_seasons(af_league_id: int) -> list[int]:
+    """Fetch all seasons available for a given league from API-Football."""
+    data = _af_get("/leagues", {"id": af_league_id})
+    if not data:
+        return []
+    try:
+        seasons = data["response"][0]["seasons"]
+        return sorted([s["year"] for s in seasons], reverse=True)
+    except (IndexError, KeyError):
+        return []
+
+def season_label(year: int, season_type: str) -> str:
+    """Human-readable season label."""
+    if season_type == "european":
+        return f"{year}/{str(year+1)[-2:]}"
+    return str(year)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA FUNCTIONS — football-data.org
@@ -380,14 +417,14 @@ def af_fixtures(league_af_id: int, season: int, status: str = "FT", limit: int =
 # ─────────────────────────────────────────────────────────────────────────────
 # UNIFIED STANDINGS  (FD preferred, AF fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-def get_standings(lg: dict, source: str) -> tuple[pd.DataFrame, str]:
+def get_standings(lg: dict, source: str, season: int) -> tuple[pd.DataFrame, str]:
     """Returns (df, source_used)"""
     if source in ("football-data.org", "Automático") and HAS_FD and lg["fd_free"]:
         df = fd_standings(lg["fd_id"])
         if not df.empty:
             return df, "fd"
     if source in ("API-Football", "Automático") and HAS_AF:
-        df = af_standings(lg["af_id"], lg["af_season"])
+        df = af_standings(lg["af_id"], season)
         if not df.empty:
             return df, "af"
     return pd.DataFrame(), "none"
@@ -469,6 +506,37 @@ with st.sidebar:
     flag         = lg["flag"]
     league_short = league_name.split(" ", 1)[1]
 
+    # ── Season selector ──────────────────────────────────────────────────────
+    if HAS_AF:
+        with st.spinner("Carregando temporadas..."):
+            avail_seasons = af_available_seasons(lg["af_id"])
+
+        if not avail_seasons:
+            avail_seasons = list(range(lg["af_season_default"], lg["af_season_default"] - 6, -1))
+
+        season_labels = [season_label(y, lg["af_season_type"]) for y in avail_seasons]
+
+        # Pre-select the default/current season
+        default_idx = 0
+        for i, y in enumerate(avail_seasons):
+            if y == lg["af_season_default"]:
+                default_idx = i
+                break
+
+        selected_label = st.selectbox(
+            "📅 Temporada",
+            season_labels,
+            index=default_idx,
+            help="Selecione a temporada para visualizar as estatísticas.",
+        )
+        season = avail_seasons[season_labels.index(selected_label)]
+        st.caption(f"API-Football · Temporada {selected_label}")
+    else:
+        # FD-only mode: no season picker (FD always returns current)
+        season = lg["af_season_default"]
+        st.caption(f"Temporada {season_label(season, lg['af_season_type'])}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     if not lg["fd_free"] and source == "football-data.org":
         st.warning("⚠️ Esta liga requer plano pago no football-data.org. Troque para API-Football.")
 
@@ -516,7 +584,7 @@ def polar_layout(fig):
 if "Classificação" in page:
     st.title(f"{flag} Classificação · {league_short}")
     with st.spinner("Carregando..."):
-        df, src = get_standings(lg, source)
+        df, src = get_standings(lg, source, season)
     if df.empty:
         st.info("Sem dados. Verifique sua chave e se a liga é suportada no plano gratuito."); st.stop()
     badge(src)
@@ -566,7 +634,7 @@ elif "Partidas" in page:
             df = fd_matches(lg["fd_id"], status=status_fd, limit=limit)
             if not df.empty: return df, "fd"
         if source in ("API-Football","Automático") and HAS_AF:
-            df = af_fixtures(lg["af_id"], lg["af_season"], status=status_af, limit=limit)
+            df = af_fixtures(lg["af_id"], season, status=status_af, limit=limit)
             if not df.empty: return df, "af"
         return pd.DataFrame(), "none"
 
@@ -631,11 +699,11 @@ elif "Jogadores" in page and "Comparar" not in page:
 
     with st.spinner("Carregando jogadores..."):
         if "Artilheiros" in sub:
-            df_p = af_top_scorers(lg["af_id"], lg["af_season"]); mc = "Gols"
+            df_p = af_top_scorers(lg["af_id"], season); mc = "Gols"
         elif "Assistências" in sub:
-            df_p = af_top_assists(lg["af_id"], lg["af_season"]); mc = "Assistências"
+            df_p = af_top_assists(lg["af_id"], season); mc = "Assistências"
         else:
-            df_p = af_top_cards(lg["af_id"], lg["af_season"]); mc = "Amarelos"
+            df_p = af_top_cards(lg["af_id"], season); mc = "Amarelos"
 
     if df_p.empty:
         st.info("Sem dados. Verifique a chave da API-Football."); st.stop()
@@ -719,8 +787,8 @@ elif "Comparar Jogadores" in page:
     badge("af")
 
     with st.spinner("Carregando jogadores..."):
-        df_s = af_top_scorers(lg["af_id"], lg["af_season"])
-        df_a = af_top_assists(lg["af_id"], lg["af_season"])
+        df_s = af_top_scorers(lg["af_id"], season)
+        df_a = af_top_assists(lg["af_id"], season)
 
     df_all = pd.concat([df_s,df_a]).drop_duplicates("Jogador").reset_index(drop=True)
     if df_all.empty:
@@ -817,8 +885,8 @@ elif "Métricas" in page:
     badge("af")
 
     with st.spinner("Carregando..."):
-        df_s = af_top_scorers(lg["af_id"], lg["af_season"])
-        df_a = af_top_assists(lg["af_id"], lg["af_season"])
+        df_s = af_top_scorers(lg["af_id"], season)
+        df_a = af_top_assists(lg["af_id"], season)
 
     df_all = pd.concat([df_s,df_a]).drop_duplicates("Jogador").reset_index(drop=True)
     df_all = df_all[df_all["Minutos"]>=200].copy()
@@ -931,7 +999,7 @@ elif "Comparar Times" in page:
     st.title(f"🏆 Comparar Times · {league_short}")
 
     with st.spinner("Carregando classificação..."):
-        df_st, src = get_standings(lg, source)
+        df_st, src = get_standings(lg, source, season)
     if df_st.empty:
         st.info("Sem dados."); st.stop()
     badge(src)
@@ -981,13 +1049,13 @@ elif "Comparar Times" in page:
             tid = int(df_st[df_st["Time"]==team_sel].iloc[0][tid_col])
             # if came from FD we need AF team id — try lookup via standings
             if src == "fd":
-                df_af_tmp = af_standings(lg["af_id"], lg["af_season"])
+                df_af_tmp = af_standings(lg["af_id"], season)
                 if not df_af_tmp.empty:
                     row_tmp = df_af_tmp[df_af_tmp["Time"].str.contains(team_sel.split()[0], case=False, na=False)]
                     if not row_tmp.empty:
                         tid = int(row_tmp.iloc[0]["team_id_af"])
             with st.spinner(f"Carregando jogadores de {team_sel}..."):
-                df_tp = af_team_players(tid, lg["af_id"], lg["af_season"])
+                df_tp = af_team_players(tid, lg["af_id"], season)
             if not df_tp.empty:
                 show = ["Jogador","Posição","Jogos","Minutos","Gols","Assistências",
                         "G+A","Gols/90","G+A/90","Nota","Amarelos","Vermelhos"]
