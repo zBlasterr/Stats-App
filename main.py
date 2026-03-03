@@ -150,15 +150,11 @@ with st.sidebar:
     st.markdown("## ⚽ Football Stats")
     st.markdown("---")
 
-    api_key = st.text_input(
-        "🔑 API Key (football-data.org)",
-        type="password",
-        placeholder="Insira sua chave gratuita",
-        help="Obtenha grátis em football-data.org",
-    )
-
-    if not api_key:
-        st.info("👆 Insira sua API key para começar.\n\nRegistre-se gratuitamente em [football-data.org](https://www.football-data.org/client/register)")
+    try:
+        api_key = st.secrets["API_KEY"]
+    except Exception:
+        st.error("🔑 API Key não encontrada.")
+        st.info("Adicione sua API key no arquivo .streamlit/secrets.toml")
         st.stop()
 
     comp_name = st.selectbox("🏟️ Competição", list(COMPETITIONS.keys()))
