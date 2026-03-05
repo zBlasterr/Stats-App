@@ -224,9 +224,14 @@ def pizza_chart(player_name: str, metrics: list, values: list, color: str, title
         radius = max(val, 3)
         xs_c = [0] + [math.cos(math.radians(t)) * radius for t in theta_range] + [0]
         ys_c = [0] + [math.sin(math.radians(t)) * radius for t in theta_range] + [0]
+        # Convert hex color to rgba with 0.75 opacity
+        r_int = int(color[1:3], 16)
+        g_int = int(color[3:5], 16)
+        b_int = int(color[5:7], 16)
+        fill_rgba = f"rgba({r_int},{g_int},{b_int},0.75)"
         fig.add_trace(go.Scatter(
             x=xs_c, y=ys_c, fill="toself",
-            fillcolor=color + "bf",
+            fillcolor=fill_rgba,
             line=dict(color=color, width=1.5),
             hovertemplate=f"<b>{metric}</b><br>Percentil: {val:.0f}<extra></extra>",
             showlegend=False, mode="lines",
